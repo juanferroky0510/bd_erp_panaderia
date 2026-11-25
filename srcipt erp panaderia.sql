@@ -1,6 +1,5 @@
 USE `erp_panaderia`;
 
-
 -- ++++++++++++++++++++++++++++++++++++++++++++++++++++
 -- PROCEDIMIENTOS ALMACENADOS
 -- ++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -507,6 +506,232 @@ CALL spBuscarProveedor('ProveedorInexistente');
 select * from vwRptProveedor;
 
 
+-- -----------------------------------------------------
+-- registrar asistencia del empleado
+-- -----------------------------------------------------
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS `spRegistrarAsistencia`$$
+
+CREATE PROCEDURE `spRegistrarAsistencia` (
+    IN p_idEmpleado INT,
+    IN p_observaciones VARCHAR(100)
+)
+BEGIN
+    DECLARE v_estadoEmpleado VARCHAR(45);
+    DECLARE v_nombreCompleto VARCHAR(150);
+    DECLARE v_horaInicio TIME;
+    DECLARE v_tolerancia INT;
+    
+    DECLARE v_idAsistenciaAbierta INT;
+    DECLARE v_horaEntradaAbierta DATETIME;
+    DECLARE v_obsActual VARCHAR(100);
+    
+    DECLARE v_ahora DATETIME;
+    DECLARE v_limiteEntrada DATETIME;
+    DECLARE v_minutosRetardo INT DEFAULT 0;
+    DECLARE v_horasTrabajadas INT DEFAULT 0;
+    DECLARE v_obsLimpia VARCHAR(100);
+
+    SET v_ahora = NOW();
+    SET v_obsLimpia = NULLIF(TRIM(p_observaciones), '');
+
+    -- 1. Verificar que el empleado exista, esté ACTIVO y obtener su turno
+    SELECT 
+        e.`estado`,
+        CONCAT(e.`nombreEmpleado`, ' ', e.`apellidoPaterno`, ' ', e.`apellidoMaterno`),
+        t.`horaInicio`,
+        IFNULL(t.`toleranciaMinutos`, 0)
+    INTO 
+        v_estadoEmpleado, v_nombreCompleto, v_horaInicio, v_tolerancia
+    FROM `empleados` e
+    INNER JOIN `turnos` t ON e.`turnos_idTurno` = t.`idTurno`
+    WHERE e.`idEmpleado` = p_idEmpleado
+    LIMIT 1;
+
+    IF v_estadoEmpleado IS NULL OR v_estadoEmpleado <> 'ACTIVO' THEN
+        SELECT '0' AS ban, 'Empleado no encontrado o dado de baja.' AS msg;
+
+    ELSE
+        -- 2. Buscar si tiene una asistencia abierta actualmente (TRABAJANDO)
+        SELECT `idAsistencia`, `horaEntrada`, `observaciones`
+        INTO v_idAsistenciaAbierta, v_horaEntradaAbierta, v_obsActual
+        FROM `asistencias`
+        WHERE `empleados_idEmpleado` = p_idEmpleado
+          AND `estadoAsistencia` = 'TRABAJANDO'
+          AND `horaSalida` IS NULL
+        ORDER BY `horaEntrada` DESC
+        LIMIT 1;
+
+        -- ==========================================================
+        -- CASO A: SEGUNDO REGISTRO -> SALIDA (FUERA DE SERVICIO)
+        -- ==========================================================
+        IF v_idAsistenciaAbierta IS NOT NULL THEN
+            SET v_horasTrabajadas = TIMESTAMPDIFF(HOUR, v_horaEntradaAbierta, v_ahora);
+
+            -- Conservar observación de entrada si existía y concatenar la de salida si se envió
+            IF v_obsLimpia IS NOT NULL AND v_obsActual IS NOT NULL THEN
+                SET v_obsLimpia = LEFT(CONCAT(v_obsActual, ' | Salida: ', v_obsLimpia), 100);
+            ELSEIF v_obsLimpia IS NULL THEN
+                SET v_obsLimpia = v_obsActual;
+            END IF;
+
+            UPDATE `asistencias`
+            SET 
+                `horaSalida` = v_ahora,
+                `horasTrabajadas` = v_horasTrabajadas,
+                `estadoAsistencia` = 'FUERA DE SERVICIO',
+                `observaciones` = v_obsLimpia
+            WHERE `idAsistencia` = v_idAsistenciaAbierta
+              AND `empleados_idEmpleado` = p_idEmpleado;
+
+            SELECT 
+                '1' AS ban,
+                CONCAT('Salida registrada correctamente. Estado: FUERA DE SERVICIO (', v_horasTrabajadas, ' hrs trabajadas).') AS msg,
+                v_idAsistenciaAbierta AS idAsistencia,
+                v_nombreCompleto AS nombreCompleto,
+                DATE_FORMAT(v_horaEntradaAbierta, '%Y-%m-%d %H:%i:%s') AS horaEntrada,
+                DATE_FORMAT(v_ahora, '%Y-%m-%d %H:%i:%s') AS horaSalida,
+                v_horasTrabajadas AS horasTrabajadas,
+                'FUERA DE SERVICIO' AS estadoAsistencia;
+
+        -- ==========================================================
+        -- VALIDACIÓN: EVITAR DOBLE JORNADA EN EL MISMO DÍA
+        -- ==========================================================
+        ELSEIF EXISTS (
+            SELECT 1 FROM `asistencias`
+            WHERE `empleados_idEmpleado` = p_idEmpleado
+              AND DATE(`horaEntrada`) = DATE(v_ahora)
+              AND `estadoAsistencia` = 'FUERA DE SERVICIO'
+        ) THEN
+            SELECT '0' AS ban, 'Ya registraste tu entrada y salida correspondientes al día de hoy.' AS msg;
+
+        -- ==========================================================
+        -- CASO B: PRIMER REGISTRO DEL DÍA -> ENTRADA (TRABAJANDO)
+        -- ==========================================================
+        ELSE
+            -- Calcular hora límite sumando la tolerancia a la hora de inicio del turno
+            SET v_limiteEntrada = ADDTIME(
+                TIMESTAMP(DATE(v_ahora), v_horaInicio),
+                SEC_TO_TIME(v_tolerancia * 60)
+            );
+
+            -- Si entró después del límite de tolerancia, calcular minutos de retardo
+            IF v_ahora > v_limiteEntrada THEN
+                SET v_minutosRetardo = TIMESTAMPDIFF(MINUTE, v_limiteEntrada, v_ahora);
+            ELSE
+                SET v_minutosRetardo = 0;
+            END IF;
+
+            INSERT INTO `asistencias` (
+                `horaEntrada`,
+                `horaSalida`,
+                `minutosRetardo`,
+                `horasTrabajadas`,
+                `estadoAsistencia`,
+                `observaciones`,
+                `empleados_idEmpleado`
+            ) VALUES (
+                v_ahora,
+                NULL,
+                v_minutosRetardo,
+                0,
+                'TRABAJANDO',
+                v_obsLimpia,
+                p_idEmpleado
+            );
+
+            SELECT 
+                '1' AS ban,
+                IF(
+                    v_minutosRetardo > 0,
+                    CONCAT('Entrada registrada con ', v_minutosRetardo, ' min de retardo. Estado: TRABAJANDO.'),
+                    'Entrada registrada a tiempo. Estado: TRABAJANDO.'
+                ) AS msg,
+                LAST_INSERT_ID() AS idAsistencia,
+                v_nombreCompleto AS nombreCompleto,
+                DATE_FORMAT(v_ahora, '%Y-%m-%d %H:%i:%s') AS horaEntrada,
+                NULL AS horaSalida,
+                v_minutosRetardo AS minutosRetardo,
+                'TRABAJANDO' AS estadoAsistencia;
+        END IF;
+    END IF;
+END$$
+
+DELIMITER ;
+
+
+-- -----------------------------------------------------
+-- procedimiento auxiliar para saber el estado de la asistencia del empleado de ese dia
+-- -----------------------------------------------------
+
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS `spEstadoAsistenciaHoy`$$
+
+CREATE PROCEDURE `spEstadoAsistenciaHoy` (
+    IN p_idEmpleado INT
+)
+BEGIN
+    -- Prioriza si tiene un turno abierto (TRABAJANDO) o el registro de hoy
+    IF EXISTS (
+        SELECT 1 FROM `asistencias`
+        WHERE `empleados_idEmpleado` = p_idEmpleado
+          AND (`estadoAsistencia` = 'TRABAJANDO' OR DATE(`horaEntrada`) = CURDATE())
+    ) THEN
+        SELECT 
+            '1' AS ban,
+            'Registro de asistencia encontrado.' AS msg,
+            `idAsistencia`,
+            DATE_FORMAT(`horaEntrada`, '%Y-%m-%d %H:%i:%s') AS horaEntrada,
+            DATE_FORMAT(`horaSalida`, '%Y-%m-%d %H:%i:%s') AS horaSalida,
+            IFNULL(`minutosRetardo`, 0) AS minutosRetardo,
+            IFNULL(`horasTrabajadas`, 0) AS horasTrabajadas,
+            `estadoAsistencia`,
+            IFNULL(`observaciones`, '') AS observaciones
+        FROM `asistencias`
+        WHERE `empleados_idEmpleado` = p_idEmpleado
+          AND (`estadoAsistencia` = 'TRABAJANDO' OR DATE(`horaEntrada`) = CURDATE())
+        ORDER BY `horaEntrada` DESC
+        LIMIT 1;
+    ELSE
+        SELECT 
+            '1' AS ban,
+            'Aún no has registrado asistencia hoy.' AS msg,
+            NULL AS idAsistencia,
+            NULL AS horaEntrada,
+            NULL AS horaSalida,
+            0 AS minutosRetardo,
+            0 AS horasTrabajadas,
+            'SIN REGISTRO' AS estadoAsistencia,
+            '' AS observaciones;
+    END IF;
+END$$
+
+DELIMITER ;
+
+
+
+-- 1. Consultar estado inicial de Juan Fernando (idEmpleado = 1) -> Debe decir 'SIN REGISTRO'
+CALL spEstadoAsistenciaHoy(1);
+
+-- 2. Primera asistencia del día (Entrada) -> Debe insertar y poner estadoAsistencia = 'TRABAJANDO'
+CALL spRegistrarAsistencia(1, 'Inicio de turno normal');
+
+-- 3. Segunda asistencia del día (Salida) -> Debe actualizar horaSalida y cambiar a 'FUERA DE SERVICIO'
+CALL spRegistrarAsistencia(1, 'Cierre de turno sin novedades');
+
+-- 4. Intentar una tercera vez el mismo día -> Debe devolver ban = '0' bloqueando el duplicado
+CALL spRegistrarAsistencia(1, 'Intento extra');
+
+-- 5. Consultar la vista general
+SELECT * FROM `vwRptAsistencias`;
+
+select * from asistencias;
+
+
+
 -- ++++++++++++++++++++++++++++++++++++++++++++++++++++
 -- VISTAS
 -- ++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -532,6 +757,34 @@ FROM `proveedores`
 ORDER BY `estadoProveedor` ASC, `nombreProv` ASC;
 
 select * from vwRptProveedor;
+
+
+
+-- -----------------------------------------------------
+-- reporte asistencias empleado
+-- -----------------------------------------------------
+
+CREATE OR REPLACE VIEW `vwRptAsistencias` AS
+SELECT 
+    a.`idAsistencia`,
+    e.`idEmpleado`,
+    CONCAT(e.`nombreEmpleado`, ' ', e.`apellidoPaterno`, ' ', e.`apellidoMaterno`) AS nombreCompleto,
+    p.`nombrePuesto` AS puesto,
+    t.`nombreTurno` AS turno,
+    DATE_FORMAT(a.`horaEntrada`, '%Y-%m-%d') AS fecha,
+    DATE_FORMAT(a.`horaEntrada`, '%H:%i:%s') AS horaEntrada,
+    IFNULL(DATE_FORMAT(a.`horaSalida`, '%H:%i:%s'), 'En curso') AS horaSalida,
+    IFNULL(a.`minutosRetardo`, 0) AS minutosRetardo,
+    IFNULL(a.`horasTrabajadas`, 0) AS horasTrabajadas,
+    a.`estadoAsistencia`,
+    IFNULL(a.`observaciones`, '-') AS observaciones
+FROM `asistencias` a
+INNER JOIN `empleados` e ON a.`empleados_idEmpleado` = e.`idEmpleado`
+INNER JOIN `puestos` p ON e.`puestos_idPuesto` = p.`idPuesto`
+INNER JOIN `turnos` t ON e.`turnos_idTurno` = t.`idTurno`
+ORDER BY a.`horaEntrada` DESC;
+
+
 
 
 
